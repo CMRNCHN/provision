@@ -45,6 +45,8 @@ from gui import Dashboard
 from onboarding import BitwardenConfig, Onboarding, OnboardingConfig
 from transaction_db import TransactionDatabase
 
+TEST_DB_KEY = "ab" * 32  # fixed, valid hex — real randomness isn't needed for tests
+
 
 class FakeAudit:
     def __init__(self):
@@ -388,14 +390,107 @@ class TransactionDatabaseTests(unittest.TestCase):
     def test_permissions_and_missing_delete(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "transactions.db"
-            database = TransactionDatabase(db_path)
+            database = TransactionDatabase(db_path, encryption_key=TEST_DB_KEY)
             self.assertEqual(stat.S_IMODE(db_path.stat().st_mode), 0o600)
             with self.assertLogs(level="WARNING"):
                 self.assertFalse(database.delete_transaction(999))
 
+    def test_db_file_is_encrypted_at_rest_not_plaintext_sqlite(self):
+        """The whole point: plain sqlite3 must not be able to read it, not
+        just "permission denied" — actually encrypted, not merely
+        access-restricted.
+        """
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "transactions.db"
+            database = TransactionDatabase(db_path, encryption_key=TEST_DB_KEY)
+            database.add_transaction("2026-07-19", 12.50, "Example", "Ada Lovelace", "1111")
+
+            plain = sqlite3.connect(str(db_path))
+            with self.assertRaises(sqlite3.DatabaseError):
+                plain.execute("SELECT * FROM transactions").fetchall()
+            plain.close()
+
+    def test_round_trips_with_the_right_key_across_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "transactions.db"
+            TransactionDatabase(db_path, encryption_key=TEST_DB_KEY).add_transaction(
+                "2026-07-19", 12.50, "Example", "Ada Lovelace", "1111"
+            )
+            reopened = TransactionDatabase(db_path, encryption_key=TEST_DB_KEY)
+            transactions = reopened.get_all_transactions()
+            self.assertEqual(len(transactions), 1)
+            self.assertEqual(transactions[0]["merchant"], "Example")
+
+    def test_wrong_key_fails_cleanly_instead_of_returning_garbage(self):
+        import transaction_db
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "transactions.db"
+            TransactionDatabase(db_path, encryption_key=TEST_DB_KEY).add_transaction(
+                "2026-07-19", 12.50, "Example", "Ada Lovelace", "1111"
+            )
+            with self.assertRaises(transaction_db.DB_ERRORS):
+                TransactionDatabase(db_path, encryption_key="cd" * 32)
+
+    def test_migrates_a_plaintext_db_in_place_preserving_data(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "transactions.db"
+
+            legacy = sqlite3.connect(str(db_path))
+            legacy.execute(
+                """
+                CREATE TABLE transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL, amount REAL NOT NULL, merchant TEXT NOT NULL,
+                    employee_name TEXT NOT NULL, card_number TEXT NOT NULL,
+                    created_at TEXT NOT NULL, employee_file_date TEXT, employee_id TEXT
+                )
+                """
+            )
+            legacy.execute(
+                "CREATE TABLE employee_budgets (employee_id TEXT PRIMARY KEY, "
+                "employee_name TEXT NOT NULL, opening_spend REAL NOT NULL DEFAULT 0, "
+                "spend_limit REAL NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO transactions "
+                "(date, amount, merchant, employee_name, card_number, created_at) "
+                "VALUES ('2026-01-01', 42.5, 'Coffee Co', 'Ada Lovelace', '1234', "
+                "'2026-01-01T00:00:00')"
+            )
+            legacy.execute(
+                "INSERT INTO employee_budgets VALUES "
+                "('employee-uuid', 'Ada Lovelace', 0, 500, '2026-01-01T00:00:00')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = TransactionDatabase(db_path, encryption_key=TEST_DB_KEY)
+            transactions = migrated.get_all_transactions()
+            self.assertEqual(len(transactions), 1)
+            self.assertEqual(transactions[0]["merchant"], "Coffee Co")
+            budgets = migrated.get_employee_budgets()
+            self.assertEqual(len(budgets), 1)
+            self.assertEqual(budgets[0]["employee_name"], "Ada Lovelace")
+
+            # File on disk is now genuinely encrypted, not just "migrated" in memory.
+            plain = sqlite3.connect(str(db_path))
+            with self.assertRaises(sqlite3.DatabaseError):
+                plain.execute("SELECT * FROM transactions").fetchall()
+            plain.close()
+
+            # Re-opening again (second launch) must not re-run the migration
+            # or lose data — it should just work against the now-encrypted file.
+            reopened = TransactionDatabase(db_path, encryption_key=TEST_DB_KEY)
+            self.assertEqual(len(reopened.get_all_transactions()), 1)
+
     def test_transactions_can_be_linked_to_immutable_employee_id(self):
         with tempfile.TemporaryDirectory() as directory:
-            database = TransactionDatabase(Path(directory) / "transactions.db")
+            database = TransactionDatabase(Path(directory) / "transactions.db", encryption_key=TEST_DB_KEY)
             database.add_transaction(
                 "2026-07-19",
                 12.50,
@@ -410,7 +505,7 @@ class TransactionDatabaseTests(unittest.TestCase):
 
     def test_employee_budget_combines_opening_spend_and_transactions(self):
         with tempfile.TemporaryDirectory() as directory:
-            database = TransactionDatabase(Path(directory) / "transactions.db")
+            database = TransactionDatabase(Path(directory) / "transactions.db", encryption_key=TEST_DB_KEY)
             self.assertTrue(
                 database.set_employee_budget(
                     "employee-uuid",

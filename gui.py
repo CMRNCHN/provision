@@ -56,7 +56,7 @@ from employee_profiles import (
     RECORD_ROLES,
 )
 from hq_template import HQ_TEMPLATE_FIELDS, write_hq_file
-from integrations import BitwardenService, CredentialStore, PinAuth
+from integrations import BitwardenService, CredentialStore, PinAuth, get_or_create_db_key
 from onboarding import BitwardenConfig, Onboarding, OnboardingConfig
 from secure_delete import (
     BW_SHRED_MODES,
@@ -884,7 +884,9 @@ class AppGUI:
 
         self.credential_store = CredentialStore()
         self.bw_service = BitwardenService()
-        self.transaction_db = TransactionDatabase()
+        self.transaction_db = TransactionDatabase(
+            encryption_key=get_or_create_db_key(self.credential_store)
+        )
         self.profile_store = EmployeeProfileStore()
         self.profile_sync = ProfileSyncService(self.bw_service, self.profile_store)
         self.audit = get_audit_logger()

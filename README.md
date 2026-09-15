@@ -6,7 +6,7 @@ An automated desktop tool for streamlining new employee onboarding tasks. The ap
 
 - **Bitwarden unlock** — workspace opens after Bitwarden master password login/unlock (no separate app password)
 - **Local credential store** — settings and remembered Bitwarden email in a chmod-600 JSON file under `~/.provision/` (not Keychain-backed — unsigned `.app` launches would trigger a Keychain permission prompt on every read)
-- **Transaction Logging** — local SQLite with owner-only (`0o600`) permissions — **not encrypted at rest** (FileVault recommended)
+- **Transaction Logging** — SQLCipher-encrypted local SQLite, owner-only (`0o600`) permissions on top (FileVault still recommended — see [SECURITY_FEATURES.md](SECURITY_FEATURES.md))
 - **Local disposal modes** — standard unlink, overwrite-then-delete, or best-effort secure erase (APFS/SSD: FileVault is the real protection)
 - **Automated Data Retention** — 5/10/15/20 day lifecycle
 - **Audit logging** — auth, imports, transactions, retention, config
@@ -82,7 +82,7 @@ chmod +x build.sh
 
 ## Honest limitations
 
-- Transaction DB is **plaintext SQLite** with `chmod 600` — enable **FileVault** on macOS (the app warns at launch if FileVault is Off). Full SQLCipher encryption is future work.
+- Transaction DB is SQLCipher-encrypted (`chmod 600` on top) — still enable **FileVault** on macOS (the app warns at launch if FileVault is Off): the encryption key itself lives in the same local credential store as everything else, so FileVault is what protects the whole local-storage layer, not just this one file.
 - Partner signup is **assisted**, not fully automated: Provision opens the page, prefills what it can (or hands off to the system browser on bot blocks), and shows an in-app Account assist panel with per-field Copy/Paste plus ⌘1–⌘6 hotkeys. CAPTCHA and final submit always stay with you.
 - Outlook must be marked Done before Hyatt/Marriott for that employee; Skip leaves accounts pending; Retry recreates the signup attempt.
 - Structured clipboard payloads (`key: value` lines) are Keysmith-ready if you want an optional overlay macro — Keysmith is not required, and there is no KeyCue integration.

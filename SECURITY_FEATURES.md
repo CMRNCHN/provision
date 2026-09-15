@@ -25,9 +25,10 @@ Security controls for application and Bitwarden authentication, local settings, 
 
 ### 3. Transaction Logging
 
-- Local SQLite at `~/.provision_transactions.db`
+- SQLCipher-encrypted at `~/.provision_transactions.db` — genuinely unreadable without the key, not just permission-gated (a plain `sqlite3` connection to the file fails with "file is not a database")
 - File mode is enforced as **`0o600`** before every SQLite connection
-- **Not encrypted at rest** (SQLCipher is out of scope for this release; tracked as future work)
+- The encryption key is a random 256-bit value generated once and stored in the same chmod-600 `CredentialStore` as every other local secret in this document — not tied to the Bitwarden master password or PIN, so the DB opens independent of vault-unlock state (e.g. retention's day-15 shred check)
+- A DB written before this was added migrates in place on first launch: detected via probe-connect, every table copied into a freshly encrypted file, original replaced — logged either way
 - Add / list / export CSV / delete by database id (Treeview `iid`)
 
 ### 4. Automated Data Retention
@@ -105,23 +106,23 @@ Logged events include: authentication, imports, deletions, transaction add/delet
 ## Dependencies
 
 - `requests`, `selenium`, `msal`, `tkinterdnd2-universal` (DnD optional; falls back on Python builds without Tk DnD)
-- **No** `pysqlcipher` / SQLCipher in this release
+- `sqlcipher3` — encrypts the transaction DB at rest
 
 ## Best practices
 
 1. Use separate strong app and Bitwarden passwords; enable Bitwarden 2FA
 2. Review `~/.provision_audit.log` periodically
-3. Treat `~/.provision_transactions.db` as sensitive — **FileVault required for production**; the app warns at launch if FileVault is Off
+3. `~/.provision_transactions.db` is SQLCipher-encrypted, but **FileVault is still required for production** — the encryption key itself lives in the same chmod-600 credential store as everything else, so FileVault is what protects the whole local-storage layer at rest, not just this one file. The app warns at launch if FileVault is Off
 4. Respond to retention prompts promptly
 
 ## Future work
 
-- Full SQLCipher (or equivalent) encryption at rest
 - Biometric unlock
 - Deeper anti-bot partner enrollment automation
 
 ## Version
 
+- **0.5.0** — Transaction DB encrypted at rest via SQLCipher, with in-place migration of pre-existing plaintext databases
 - **0.4.0** — Field Autofill browser extension (fills signup fields beyond username/password); fixed a dead status-bar update, a Finder AppleScript crash, and the assist walkthrough's fixed field order
 - **0.3.1** — Intake watch folder moved from `~/Downloads` to a hardened `~/Downloads/Secure Downloads` subfolder (owner-only permissions, Spotlight/Time Machine excluded)
 - **0.3.0** — Renamed from DOWNLOWd to Provision; PIN unlock hardened with failed-attempt lockout and a stronger, versioned KDF

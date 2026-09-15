@@ -36,6 +36,7 @@ APP_PIN_ITERS_KEY = "app_pin_iters"
 APP_PIN_FAILS_KEY = "app_pin_fails"
 APP_PIN_LOCK_UNTIL_KEY = "app_pin_lock_until"
 BW_SECRET_KEY = "bw_master_secret"
+DB_ENCRYPTION_KEY = "db_encryption_key"
 PBKDF2_ITERATIONS = 200_000
 # New PINs use a higher KDF cost to slow offline brute-force of the on-disk
 # encrypted master password; legacy PINs keep working via the stored count.
@@ -152,6 +153,26 @@ class CredentialStore:
                 changed = True
         if changed:
             self._save()
+
+
+def get_or_create_db_key(store: CredentialStore) -> str:
+    """Return this machine's transaction-DB encryption key, generating and
+    persisting one on first use.
+
+    Deliberately not tied to the Bitwarden master password or PIN — the
+    transaction DB needs to open/query independent of vault-unlock state
+    (e.g. retention's day-15 shred check), and tying it to a per-unlock
+    secret would be a much bigger workflow change than this warrants. This
+    keeps the DB's threat model identical to every other local secret in
+    CredentialStore: chmod-600 JSON, no OS-level gate beyond file
+    permissions and FileVault.
+    """
+    existing = store.get(DB_ENCRYPTION_KEY)
+    if existing:
+        return existing
+    key = secrets.token_hex(32)
+    store.update({DB_ENCRYPTION_KEY: key})
+    return key
 
 
 class PinAuth:
