@@ -167,6 +167,117 @@ class BitwardenLoginDialogSmokeTest(unittest.TestCase):
                 pass
 
 
+class DashboardSheetSmokeTest(unittest.TestCase):
+    """Real widget-construction coverage for Dashboard's in-window "sheet"
+    builders — the highest-value untested surface in gui.py after the
+    login dialog and AppGUI itself. A typo in a CTkButton call or a bad
+    font= tuple in any of these would currently ship undetected.
+
+    Builds a real Dashboard against a minimal stand-in for AppGUI (just
+    the handful of attributes Dashboard.__init__ actually reads), rather
+    than a full AppGUI() — Dashboard's own _build() is what actually
+    constructs self._sheet / self.profile_viewer / etc. that these methods
+    depend on, so a real Dashboard is what's needed, not a bypassed one.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_dir = Path(self._tmp.name)
+        self._patches = contextlib.ExitStack()
+        _patch_audit_singleton(self.tmp_dir, self._patches)
+        self._patches.enter_context(
+            mock.patch.object(gui, "DOWNLOADS", self.tmp_dir / "Downloads" / "Secure Downloads")
+        )
+        self._patches.enter_context(mock.patch("subprocess.run"))
+
+        self.credential_store = CredentialStore(path=self.tmp_dir / "credentials.json")
+        self.transaction_db = transaction_db.TransactionDatabase(
+            self.tmp_dir / "transactions.db", encryption_key="ab" * 32
+        )
+        self.profile_store = employee_profiles.EmployeeProfileStore(self.tmp_dir / "profiles.json")
+        self.profile_sync = employee_profiles.ProfileSyncService(
+            mock.MagicMock(), self.profile_store
+        )
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+
+        class FakeApp:
+            pass
+
+        self.app = FakeApp()
+        self.app.root = self.root
+        self.app.credential_store = self.credential_store
+        self.app.bw_service = mock.MagicMock()
+        self.app.onboarding_logic = mock.MagicMock()
+        self.app.transaction_db = self.transaction_db
+        self.app.profile_store = self.profile_store
+        self.app.profile_sync = self.profile_sync
+
+        self.dashboard = gui.Dashboard(self.root, self.app)
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+        self._patches.close()
+        _reset_leaky_loggers()
+        self._tmp.cleanup()
+
+    def test_open_sheet_builds_and_packs_a_real_widget_tree(self):
+        built_hosts = []
+
+        def builder(host):
+            built_hosts.append(host)
+            tk.Label(host, text="hello").pack()
+
+        result_host = self.dashboard._open_sheet("Test sheet", builder)
+        self.assertTrue(self.dashboard._sheet.winfo_manager())
+        self.assertEqual(built_hosts, [result_host])
+        self.assertTrue(result_host.winfo_exists())
+
+    def test_open_settings_modal_builds_a_real_sheet(self):
+        self.dashboard._open_settings_modal()
+        self.assertTrue(self.dashboard._sheet.winfo_manager())
+
+    def test_open_manual_employee_dialog_builds_a_real_form(self):
+        self.dashboard._open_manual_employee_dialog()
+        self.assertTrue(self.dashboard._sheet.winfo_manager())
+
+    def test_render_profile_viewer_populates_the_existing_widget(self):
+        self.assertTrue(hasattr(self.dashboard, "profile_viewer"))
+        self.dashboard._render_profile_viewer("A test message")
+        children = self.dashboard.profile_viewer.winfo_children()
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].cget("text"), "A test message")
+
+    def test_show_next_budget_sheet_builds_a_real_sheet_when_queued(self):
+        self.dashboard._budget_queue.append({"display_name": "Ada Lovelace"})
+        self.dashboard._show_next_budget_sheet()
+        self.assertTrue(self.dashboard._sheet.winfo_manager())
+        self.assertEqual(self.dashboard._budget_queue, [])
+
+    def test_show_next_budget_sheet_is_a_safe_noop_when_empty(self):
+        self.dashboard._show_next_budget_sheet()
+        self.assertFalse(self.dashboard._sheet.winfo_manager())
+
+    def test_open_employee_modal_loads_a_seeded_profile_into_the_viewer(self):
+        profile = self.profile_store.upsert(display_name="Ada Lovelace", first_name="Ada")
+        employee_id = profile["employee_id"]
+
+        self.dashboard._open_employee_modal(employee_id)
+        # get_bundle() runs on a background thread and schedules its UI
+        # update via self.after(0, ...); pump the Tk event queue instead of
+        # touching internals to let that callback actually run.
+        for _ in range(20):
+            self.root.update()
+            if self.dashboard.profile_bundle or self.dashboard.selected_profile_id:
+                break
+        self.assertEqual(self.dashboard.selected_profile_id, employee_id)
+        self.assertEqual(self.dashboard.profile_title.get(), "Ada Lovelace")
+
+
 class AppGUIConstructionSmokeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -231,6 +342,7 @@ def load_tests(loader, standard_tests, pattern):
         GuiModuleImportSmokeTest,
         CanvasWidgetSmokeTest,
         BitwardenLoginDialogSmokeTest,
+        DashboardSheetSmokeTest,
         AppGUIConstructionSmokeTest,
     ]
     suite = unittest.TestSuite()
