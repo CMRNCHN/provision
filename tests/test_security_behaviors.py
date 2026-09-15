@@ -174,6 +174,87 @@ class BitwardenSessionTests(unittest.TestCase):
                 service.resolve_collection("Shared")
 
 
+class BitwardenCliTimeoutTests(unittest.TestCase):
+    """Every `bw` CLI call used to be unbounded: a hung/flaky CLI process
+    would block forever, and since _run_bw serializes every caller behind
+    one lock, that hang froze every other part of the app waiting on the
+    same lock too (background provisioning, other profile loads, retention
+    checks) with no way to recover short of a force quit. These tests
+    simulate the hang via subprocess.TimeoutExpired (instant, no real
+    waiting) and assert it's always bounded and always handled, never left
+    to propagate unhandled out of a background thread.
+    """
+
+    def test_run_bw_applies_a_default_timeout(self):
+        service = BitwardenService()
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+            service._run_bw(["status", "--raw"], capture_output=True, text=True)
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], integrations.BW_CLI_TIMEOUT_SECONDS)
+
+    def test_run_bw_does_not_override_an_explicit_timeout(self):
+        service = BitwardenService()
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+            service._run_bw(["sync"], capture_output=True, text=True, timeout=999)
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], 999)
+
+    def test_sync_and_import_use_the_slower_timeout(self):
+        service = BitwardenService()
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+            service.sync()
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], integrations.BW_CLI_SLOW_TIMEOUT_SECONDS)
+
+    def test_get_status_raises_cleanly_on_timeout_instead_of_hanging(self):
+        service = BitwardenService()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["bw", "status"], timeout=30),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                service.get_status()
+
+    def test_unlock_returns_false_on_timeout_instead_of_hanging(self):
+        service = BitwardenService()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["bw", "unlock"], timeout=30),
+        ):
+            self.assertFalse(service.unlock("some-password"))
+        self.assertIsNone(service.session_key)
+
+    def test_login_returns_a_failure_dict_on_timeout_instead_of_hanging(self):
+        service = BitwardenService()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["bw", "login"], timeout=30),
+        ):
+            result = service.login("ops@example.com", "some-password")
+        self.assertFalse(result["success"])
+        self.assertIn("timed out", result["error"].lower())
+
+    def test_resolve_collection_converts_timeout_to_runtime_error(self):
+        service = BitwardenService()
+        with mock.patch.object(
+            service,
+            "_run_bw",
+            side_effect=subprocess.TimeoutExpired(cmd=["bw", "list"], timeout=30),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Could not resolve Bitwarden collection"):
+                service.resolve_collection("Employee Onboarding")
+
+    def test_import_json_converts_timeout_to_runtime_error(self):
+        service = BitwardenService()
+        with mock.patch.object(
+            service,
+            "_run_bw",
+            side_effect=subprocess.TimeoutExpired(cmd=["bw", "import"], timeout=90),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                service.import_json('{"items": []}')
+
+
 class AppSessionTests(unittest.TestCase):
     def test_password_is_hashed_and_wrong_password_is_rejected(self):
         store = MemoryCredentialStore()

@@ -17,6 +17,15 @@ from typing import Any, Dict, List, Optional
 CREDENTIALS_FILE = Path.home() / ".onboarding_credentials.json"
 SECURE_CREDENTIALS_FILE = Path.home() / ".provision" / "credentials.json"
 
+# Every `bw` CLI call funnels through _run_bw() behind a single lock, so an
+# unbounded hang (flaky network, a stuck CLI prompt, a slow Bitwarden server)
+# doesn't just freeze the caller — it blocks every other part of the app
+# waiting on that same lock (background provisioning, other profile loads,
+# retention checks) indefinitely, with no way to recover short of a force
+# quit. Every subprocess.run() against `bw` must be bounded.
+BW_CLI_TIMEOUT_SECONDS = 30
+BW_CLI_SLOW_TIMEOUT_SECONDS = 90  # sync / import: legitimately slower on a large vault
+
 APP_PASSWORD_HASH_KEY = "app_password_hash"
 APP_PASSWORD_SALT_KEY = "app_password_salt"
 APP_SESSION_TOKEN_KEY = "app_session_token"
@@ -473,7 +482,10 @@ class BitwardenService:
 
         Serialized behind a lock so concurrent callers (background account
         provisioning + foreground profile loads) never invoke `bw` at once.
+        Always bounded — see BW_CLI_TIMEOUT_SECONDS — unless the caller
+        passes its own `timeout`.
         """
+        kwargs.setdefault("timeout", BW_CLI_TIMEOUT_SECONDS)
         with self._cli_lock:
             return subprocess.run(
                 ["bw", *args],
@@ -496,7 +508,12 @@ class BitwardenService:
             )
             status = json.loads(proc.stdout).get("status")
             return status
-        except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            json.JSONDecodeError,
+        ) as e:
             logging.error("Failed to check Bitwarden status. Is 'bw' CLI installed? Details: %s", e)
             raise
 
@@ -514,6 +531,7 @@ class BitwardenService:
                     capture_output=True,
                     text=True,
                     check=True,
+                    timeout=BW_CLI_TIMEOUT_SECONDS,
                 )
             self.session_key = proc.stdout.strip() or None
             if not self.session_key:
@@ -526,6 +544,13 @@ class BitwardenService:
             logging.error(
                 "Failed to unlock Bitwarden. The password may be incorrect. Details: %s",
                 (e.stderr or e.stdout or "").strip(),
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            self.clear_session()
+            logging.error(
+                "Bitwarden unlock timed out after %ss — CLI may be hung or waiting on network.",
+                BW_CLI_TIMEOUT_SECONDS,
             )
             return False
         except OSError as e:
@@ -551,6 +576,7 @@ class BitwardenService:
                     capture_output=True,
                     text=True,
                     check=True,
+                    timeout=BW_CLI_TIMEOUT_SECONDS,
                 )
             self.session_key = proc.stdout.strip() or None
             if not self.session_key:
@@ -569,6 +595,17 @@ class BitwardenService:
                 "success": False,
                 "two_factor_required": False,
                 "error": _clean_cli_text(stderr) or "Login failed.",
+            }
+        except subprocess.TimeoutExpired:
+            self.clear_session()
+            logging.error(
+                "Bitwarden login timed out after %ss — CLI may be hung or waiting on network.",
+                BW_CLI_TIMEOUT_SECONDS,
+            )
+            return {
+                "success": False,
+                "two_factor_required": False,
+                "error": "Bitwarden CLI timed out. Check your network and try again.",
             }
         except OSError as e:
             self.clear_session()
@@ -628,7 +665,7 @@ class BitwardenService:
                 f"Bitwarden collection '{name}' does not exist. "
                 "Select 'Personal Vault' explicitly to import outside an organization."
             )
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             raise RuntimeError(
                 f"Could not resolve Bitwarden collection '{name}'."
             ) from e
@@ -674,12 +711,18 @@ class BitwardenService:
                     capture_output=True,
                     text=True,
                     check=True,
+                    timeout=BW_CLI_SLOW_TIMEOUT_SECONDS,
                 )
             except subprocess.CalledProcessError as e:
                 detail = _clean_cli_text(e.stderr or e.stdout or "")
                 raise RuntimeError(
                     f"Bitwarden import failed for {target_name}: "
                     f"{detail or 'unknown CLI error'}"
+                ) from e
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    f"Bitwarden import for {target_name} timed out after "
+                    f"{BW_CLI_SLOW_TIMEOUT_SECONDS}s."
                 ) from e
         finally:
             if temp_file.exists():
@@ -723,6 +766,7 @@ class BitwardenService:
             capture_output=True,
             text=True,
             check=True,
+            timeout=BW_CLI_SLOW_TIMEOUT_SECONDS,
         )
 
     def get_item(self, item_id: str) -> Dict[str, Any]:
