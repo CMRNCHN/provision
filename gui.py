@@ -56,7 +56,13 @@ from employee_profiles import (
     RECORD_ROLES,
 )
 from hq_template import HQ_TEMPLATE_FIELDS, write_hq_file
-from integrations import BitwardenService, CredentialStore, PinAuth, get_or_create_db_key
+from integrations import (
+    BW_CLI_TIMEOUT_SECONDS,
+    BitwardenService,
+    CredentialStore,
+    PinAuth,
+    get_or_create_db_key,
+)
 from onboarding import BitwardenConfig, Onboarding, OnboardingConfig
 from secure_delete import (
     BW_SHRED_MODES,
@@ -630,26 +636,76 @@ class BitwardenLoginDialog(ctk.CTkToplevel):
         self.destroy()
         self.on_success()
 
-    def _bw_login_or_unlock(self, email: str, password: str, status_var: tk.StringVar) -> Dict[str, Any]:
+    def _safe_after(self, callback: Callable[[], None]) -> None:
+        """`self.after(0, ...)` from a background thread, guarded for the
+        window having been closed (Cancel / WM close) while that thread was
+        still in flight — possible now that the bw call no longer blocks the
+        main thread and the dialog can be dismissed mid-call. There's
+        nothing left to update in that case, so just drop it.
+        """
         try:
-            status = self.bw_service.get_status()
-        except Exception:
-            status = "unauthenticated"
+            self.after(0, callback)
+        except (RuntimeError, tk.TclError):
+            pass
 
-        if status in {"unlocked", "locked"}:
-            ok = self.bw_service.unlock(password)
-            return {"success": ok, "error": None if ok else "Incorrect master password."}
+    def _bw_login_or_unlock_async(
+        self,
+        email: str,
+        password: str,
+        status_var: tk.StringVar,
+        on_done: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """Run the `bw` CLI calls (each bounded, but still up to tens of
+        seconds) on a background thread — these used to run inline from a
+        button click and blocked the whole Tk main loop for their entire
+        duration, which is what "frozen, had to force quit" actually was:
+        the per-call timeout capped it, but didn't get it off the UI thread.
+        `on_done` is always invoked on the main thread via `self.after`.
+        The one exception is the 2FA prompt, which is itself a Tk dialog and
+        must be shown from the main thread — the worker thread blocks on a
+        threading.Event while `self.after` schedules it there.
+        """
 
-        result = self.bw_service.login(email, password)
-        if result.get("two_factor_required"):
-            code = simpledialog.askstring("Two-Factor", "Enter your 2FA code:", parent=self)
-            if not code:
-                self.bw_service.clear_session()
-                self.audit.log_authentication(False, method="bitwarden_2fa_cancelled")
-                status_var.set("")
-                return {"success": False, "error": "Two-factor cancelled."}
-            result = self.bw_service.login(email, password, code)
-        return result
+        def worker() -> None:
+            try:
+                status = self.bw_service.get_status()
+            except Exception:
+                status = "unauthenticated"
+
+            if status in {"unlocked", "locked"}:
+                ok = self.bw_service.unlock(password)
+                result = {"success": ok, "error": None if ok else "Incorrect master password."}
+                self._safe_after(lambda: on_done(result))
+                return
+
+            result = self.bw_service.login(email, password)
+            if result.get("two_factor_required"):
+                answer: Dict[str, Optional[str]] = {}
+                got_answer = threading.Event()
+
+                def ask_2fa() -> None:
+                    answer["code"] = simpledialog.askstring(
+                        "Two-Factor", "Enter your 2FA code:", parent=self
+                    )
+                    got_answer.set()
+
+                self._safe_after(ask_2fa)
+                if not got_answer.wait(timeout=BW_CLI_TIMEOUT_SECONDS + 5):
+                    # Window was almost certainly closed before ask_2fa() could
+                    # run (and set the event) — stop waiting rather than block
+                    # this daemon thread forever.
+                    return
+                code = answer.get("code")
+                if not code:
+                    self.bw_service.clear_session()
+                    self.audit.log_authentication(False, method="bitwarden_2fa_cancelled")
+                    self._safe_after(lambda: status_var.set(""))
+                    self._safe_after(lambda: on_done({"success": False, "error": "Two-factor cancelled."}))
+                    return
+                result = self.bw_service.login(email, password, code)
+            self._safe_after(lambda: on_done(result))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_pin_setup(self) -> None:
         assert self._card is not None
@@ -704,26 +760,30 @@ class BitwardenLoginDialog(ctk.CTkToplevel):
                 return
 
             status_var.set("Signing in to Bitwarden…")
-            self.update_idletasks()
-            result = self._bw_login_or_unlock(email, password, status_var)
-            if not result.get("success"):
-                self.audit.log_authentication(False, method="bitwarden_pin_setup")
-                status_var.set("")
-                messagebox.showerror(
-                    "Bitwarden Login Failed",
-                    result.get("error") or "Could not sign in.",
-                    parent=self,
-                )
-                return
+            setup_button.configure(state="disabled")
 
-            setup_err = self.pin_auth.setup(email=email, master_password=password, pin=pin)
-            if setup_err:
-                status_var.set("")
-                messagebox.showerror("PIN setup failed", setup_err, parent=self)
-                return
-            self._finish_success("bitwarden_pin_setup")
+            def on_done(result: Dict[str, Any]) -> None:
+                setup_button.configure(state="normal")
+                if not result.get("success"):
+                    self.audit.log_authentication(False, method="bitwarden_pin_setup")
+                    status_var.set("")
+                    messagebox.showerror(
+                        "Bitwarden Login Failed",
+                        result.get("error") or "Could not sign in.",
+                        parent=self,
+                    )
+                    return
 
-        _auth_primary_button(form, "Save PIN & Unlock", do_setup)
+                setup_err = self.pin_auth.setup(email=email, master_password=password, pin=pin)
+                if setup_err:
+                    status_var.set("")
+                    messagebox.showerror("PIN setup failed", setup_err, parent=self)
+                    return
+                self._finish_success("bitwarden_pin_setup")
+
+            self._bw_login_or_unlock_async(email, password, status_var, on_done)
+
+        setup_button = _auth_primary_button(form, "Save PIN & Unlock", do_setup)
         pin2_entry.bind("<Return>", lambda _event: do_setup())
         pin_entry.focus()
         ctk.CTkLabel(
@@ -800,18 +860,22 @@ class BitwardenLoginDialog(ctk.CTkToplevel):
                 messagebox.showerror("Missing email", "No Bitwarden email on file. Reset PIN setup.", parent=self)
                 return
             status_var.set("Unlocking Bitwarden…")
-            self.update_idletasks()
-            result = self._bw_login_or_unlock(email_addr, master, status_var)
-            if result.get("success"):
-                self._finish_success("pin")
-            else:
-                self.audit.log_authentication(False, method="pin_bitwarden")
-                status_var.set("")
-                messagebox.showerror(
-                    "Bitwarden Unlock Failed",
-                    result.get("error") or "Could not unlock the vault.",
-                    parent=self,
-                )
+            unlock_button.configure(state="disabled")
+
+            def on_done(result: Dict[str, Any]) -> None:
+                unlock_button.configure(state="normal")
+                if result.get("success"):
+                    self._finish_success("pin")
+                else:
+                    self.audit.log_authentication(False, method="pin_bitwarden")
+                    status_var.set("")
+                    messagebox.showerror(
+                        "Bitwarden Unlock Failed",
+                        result.get("error") or "Could not unlock the vault.",
+                        parent=self,
+                    )
+
+            self._bw_login_or_unlock_async(email_addr, master, status_var, on_done)
 
         def reset_pin():
             if not messagebox.askyesno(
@@ -824,7 +888,7 @@ class BitwardenLoginDialog(ctk.CTkToplevel):
             self.bw_service.clear_session()
             self._rebuild()
 
-        _auth_primary_button(form, "Unlock", do_unlock)
+        unlock_button = _auth_primary_button(form, "Unlock", do_unlock)
         pin_entry.bind("<Return>", lambda _event: do_unlock())
         pin_entry.focus()
         refresh_lock()

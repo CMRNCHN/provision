@@ -8,6 +8,8 @@ import contextlib
 import logging
 import os
 import tempfile
+import threading
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -165,6 +167,93 @@ class BitwardenLoginDialogSmokeTest(unittest.TestCase):
                 dialog.destroy()
             except tk.TclError:
                 pass
+
+    def test_pin_unlock_runs_the_bw_call_off_the_main_thread(self):
+        """Regression test for a real, reproduced freeze: PIN unlock used to
+        call the blocking `bw` CLI subprocess directly from the button-click
+        handler on the Tk main thread, so any slow `bw unlock` call (network
+        hiccup, vault contention, etc.) froze the whole GUI for its full
+        duration — a bounded timeout still means a real, user-visible hang,
+        not a fix. Needs a live `mainloop()` (not the usual `root.update()`
+        pump): `self.after()` invoked from a background thread only works
+        once Tk considers itself "in the main loop".
+        """
+        credential_store = CredentialStore(path=self.tmp_dir / "credentials.json")
+        from integrations import PinAuth
+
+        setup_error = PinAuth(credential_store).setup(
+            email="ops@example.com", master_password="horse battery", pin="Ops7"
+        )
+        self.assertIsNone(setup_error)
+
+        bw_service = mock.MagicMock()
+        bw_service.get_status.return_value = "locked"
+        unlock_finished = threading.Event()
+        SLOW_UNLOCK_SECONDS = 1.5
+
+        def slow_unlock(password):
+            time.sleep(SLOW_UNLOCK_SECONDS)
+            unlock_finished.set()
+            return True
+
+        bw_service.unlock.side_effect = slow_unlock
+
+        dialog = gui.BitwardenLoginDialog(
+            self.root, bw_service, credential_store, on_success=lambda: None
+        )
+
+        def find_entries(widget):
+            found = []
+            for child in widget.winfo_children():
+                if child.__class__.__name__ == "CTkEntry":
+                    found.append(child)
+                found.extend(find_entries(child))
+            return found
+
+        def find_button(widget, text):
+            for child in widget.winfo_children():
+                if child.__class__.__name__ == "CTkButton":
+                    if child.cget("text") == text:
+                        return child
+                found = find_button(child, text)
+                if found:
+                    return found
+            return None
+
+        find_entries(dialog._form)[0].insert(0, "Ops7")
+        button = find_button(dialog._form, "Unlock")
+
+        results: dict = {"tick_count": 0}
+
+        def click_and_time():
+            t0 = time.time()
+            button.invoke()
+            results["click_elapsed"] = time.time() - t0
+
+        def tick():
+            results["tick_count"] += 1
+            self.root.after(20, tick)
+
+        self.root.after(10, click_and_time)
+        self.root.after(30, tick)
+        self.root.after(int((SLOW_UNLOCK_SECONDS + 1.0) * 1000), self.root.quit)
+        self.root.mainloop()
+
+        # click_elapsed includes the real, pre-existing, synchronous PIN->PBKDF2
+        # decrypt (attempt_unlock(), ~0.3s) needed before the bw call can even
+        # start — that part isn't this fix's concern. What matters is that it
+        # stays far below SLOW_UNLOCK_SECONDS: proof bw_service.unlock() itself
+        # ran off the main thread instead of blocking the click handler.
+        self.assertLess(
+            results["click_elapsed"], SLOW_UNLOCK_SECONDS / 2,
+            "Unlock button blocked the main thread — the bw CLI call is running inline again.",
+        )
+        self.assertGreater(
+            results["tick_count"], 5,
+            "Tk event loop stopped ticking — the main thread was blocked during unlock.",
+        )
+        self.assertTrue(unlock_finished.is_set())
+        self.assertTrue(dialog.success)
 
 
 class DashboardSheetSmokeTest(unittest.TestCase):
